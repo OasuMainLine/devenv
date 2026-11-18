@@ -57,6 +57,10 @@ if [[ -n "${{_DEVENV_HOOK_DIR:-}}" ]]; then
     __devenv_enable_exit_on_cd_out=1
 fi
 
+if [[ -n "${{_DEVENV_IN_SHELL:-}}" ]]; then
+    unset _DEVENV_IN_SHELL
+fi
+
 # Save PATH before ~/.bashrc potentially modifies it
 _DEVENV_PATH="$PATH"
 

@@ -4,6 +4,12 @@
 //! - `outer_shell_survives_cd_out` — #2805
 //! - `inner_shell_exits_on_cd_out` — hook-spawned shell must `exit` + write exit-dir
 //! - `hook_dir_marker_does_not_leak_to_child_shell` — #2861
+//! - `in_shell_marker_does_not_leak_to_child_shell` — `_DEVENV_IN_SHELL` must
+//!   not survive into shells started from inside a devenv shell
+//! - `no_respawn_before_devenv_root_is_exported` — prompt hook firing while the
+//!   user's rc file is still sourcing, before `DEVENV_ROOT` exists (ble.sh)
+//! - `bash_hook_registration_prefers_blesh_over_prompt_command` — ble.sh uses
+//!   `blehook PRECMD`, everything else `PROMPT_COMMAND`
 //! - `no_respawn_inside_devenv_shell` — follow-up to #2815
 //! - `fish_activation_skips_if_already_active` — avoid stacking devenv shells
 //! - `fish_follow_cd_out_preserves_history_for_cd_dash` — #2853
@@ -140,6 +146,20 @@ fn posix_shells() -> Vec<(&'static str, String)> {
     .collect()
 }
 
+/// Clear `DEVENV_ROOT`/`_DEVENV_HOOK_DIR` but *set* `_DEVENV_IN_SHELL`: the
+/// state a devenv shell is in while its rc file is still being sourced, before
+/// the env script has exported anything. Clearing matters because the suite
+/// itself may run under `devenv shell -- cargo test`, which exports
+/// `DEVENV_ROOT`; inheriting it would suppress the hook for an unrelated
+/// reason and make these tests pass vacuously.
+fn only_in_shell_marker(shell: &str) -> &'static str {
+    if shell == "fish" {
+        "set -e DEVENV_ROOT; set -e _DEVENV_HOOK_DIR; set -gx _DEVENV_IN_SHELL 1"
+    } else {
+        "unset DEVENV_ROOT _DEVENV_HOOK_DIR\nexport _DEVENV_IN_SHELL=1"
+    }
+}
+
 fn posix_path_override(dir: &Path) -> String {
     format!(r#"export PATH="{}:$PATH""#, dir.display())
 }
@@ -178,7 +198,7 @@ fn forwarded_shell_args_preserve_boundaries_in_every_shell() {
         let (shim_dir, calls) = argv_recording_devenv_shim(project.path());
         let script = match shell {
             "fish" => format!(
-                "set -e DEVENV_ROOT; set -e _DEVENV_HOOK_DIR\n\
+                "set -e DEVENV_ROOT; set -e _DEVENV_HOOK_DIR; set -e _DEVENV_IN_SHELL\n\
                  source {hook:?}\n\
                  {path}\n\
                  cd {project:?}\n\
@@ -187,7 +207,7 @@ fn forwarded_shell_args_preserve_boundaries_in_every_shell() {
                 project = project.path(),
             ),
             "nu" => format!(
-                "hide-env -i DEVENV_ROOT\nhide-env -i _DEVENV_HOOK_DIR\n\
+                "hide-env -i DEVENV_ROOT\nhide-env -i _DEVENV_HOOK_DIR\nhide-env -i _DEVENV_IN_SHELL\n\
                  source {hook:?}\n\
                  $env.PATH = ($env.PATH | prepend {shim:?})\n\
                  cd {project:?}\n\
@@ -196,7 +216,7 @@ fn forwarded_shell_args_preserve_boundaries_in_every_shell() {
                 project = project.path(),
             ),
             _ => format!(
-                "unset DEVENV_ROOT _DEVENV_HOOK_DIR\n\
+                "unset DEVENV_ROOT _DEVENV_HOOK_DIR _DEVENV_IN_SHELL\n\
                  source {hook:?}\n\
                  {path}\n\
                  cd {project:?}\n\
@@ -262,7 +282,7 @@ esac
         fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
         let script = match shell {
             "fish" => format!(
-                "set -e DEVENV_ROOT; set -e _DEVENV_HOOK_DIR\n\
+                "set -e DEVENV_ROOT; set -e _DEVENV_HOOK_DIR; set -e _DEVENV_IN_SHELL\n\
                  source {hook:?}\n\
                  {path}\n\
                  cd {subdir:?}\n\
@@ -270,7 +290,7 @@ esac
                 path = fish_path_override(shim_dir.path()),
             ),
             "nu" => format!(
-                "hide-env -i DEVENV_ROOT\nhide-env -i _DEVENV_HOOK_DIR\n\
+                "hide-env -i DEVENV_ROOT\nhide-env -i _DEVENV_HOOK_DIR\nhide-env -i _DEVENV_IN_SHELL\n\
                  source {hook:?}\n\
                  $env.PATH = ($env.PATH | prepend {shim:?})\n\
                  cd {subdir:?}\n\
@@ -278,7 +298,7 @@ esac
                 shim = shim_dir.path(),
             ),
             _ => format!(
-                "unset DEVENV_ROOT _DEVENV_HOOK_DIR\n\
+                "unset DEVENV_ROOT _DEVENV_HOOK_DIR _DEVENV_IN_SHELL\n\
                  source {hook:?}\n\
                  {path}\n\
                  cd {subdir:?}\n\
@@ -405,6 +425,80 @@ fn hook_dir_marker_does_not_leak_to_child_shell() {
 }
 
 #[test]
+fn in_shell_marker_does_not_leak_to_child_shell() {
+    // `_DEVENV_IN_SHELL` is exported onto the shell process itself, so unlike
+    // `DEVENV_ROOT` it is live before the rc file runs its first line. That
+    // also means a shell started later from inside the devenv shell would
+    // inherit it and never auto-activate anything again, so the hook moves it
+    // to a non-exported copy as soon as it is sourced. Set *only* the marker
+    // here: with `DEVENV_ROOT` also exported the child would be suppressed by
+    // `DEVENV_ROOT` instead and the test would pass vacuously.
+    for (shell, src, path_override) in shells() {
+        let project = fake_project();
+        let (shim_dir, calls) = argv_recording_devenv_shim(project.path());
+        let child_script = format!(
+            "{src}\n{po}\ncd {project:?}\n_devenv_hook\n",
+            po = path_override(shim_dir.path()),
+            project = project.path(),
+        );
+        let script = format!(
+            "{clear}\n{src}\n{shell} -c '{child_script}'\n",
+            clear = only_in_shell_marker(shell),
+        );
+        let out = run(shell, &script);
+        assert!(
+            out.status.success(),
+            "[{shell}] hook failed.\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        assert!(
+            calls.exists(),
+            "[{shell}] a shell spawned from inside a devenv shell inherited \
+             _DEVENV_IN_SHELL and refused to activate.\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+}
+
+#[test]
+fn no_respawn_before_devenv_root_is_exported() {
+    // `devenv shell` sources the user's rc file *before* exporting
+    // `DEVENV_ROOT` (`bash_init_script`, devenv/src/devenv/mod.rs), so for the
+    // whole of that file the usual "already inside devenv" marker is absent.
+    // Frameworks that render a prompt while the rc file is still being sourced
+    // — ble.sh's `ble-attach` invokes its PRECMD hooks synchronously — fire the
+    // hook inside that window, where it used to find no marker, spawn another
+    // `devenv shell`, and recurse until the machine gave up. `_DEVENV_IN_SHELL`
+    // closes the window because it is set on the child process, not by a
+    // script the child has to reach first.
+    for (shell, src) in posix_shells() {
+        let tmp = fake_project();
+        let (_bin_dir, calls) = devenv_shim();
+        let script = format!(
+            "{clear}\ncd {root:?}\n{src}\n{po}\n_devenv_hook\necho DONE\n",
+            clear = only_in_shell_marker(shell),
+            root = tmp.path(),
+            po = posix_path_override(calls.parent().unwrap()),
+        );
+        let out = run(shell, &script);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("DONE"),
+            "[{shell}] hook hung or exited unexpectedly.\nstdout: {stdout}\nstderr: {}",
+            String::from_utf8_lossy(&out.stderr),
+        );
+        let recorded = fs::read_to_string(&calls).unwrap_or_default();
+        assert!(
+            recorded.is_empty(),
+            "[{shell}] hook ran devenv from inside a devenv shell whose rc file had \
+             not yet exported DEVENV_ROOT.\nRecorded:\n{recorded}",
+        );
+    }
+}
+
+#[test]
 fn no_respawn_inside_devenv_shell() {
     for (shell, src, path_override) in shells() {
         let tmp = fake_project();
@@ -462,9 +556,9 @@ esac
             "export SHELL=/bin/bash"
         };
         let clear_markers = if shell == "fish" {
-            "set -e DEVENV_ROOT; set -e _DEVENV_HOOK_DIR"
+            "set -e DEVENV_ROOT; set -e _DEVENV_HOOK_DIR; set -e _DEVENV_IN_SHELL"
         } else {
-            "unset DEVENV_ROOT _DEVENV_HOOK_DIR"
+            "unset DEVENV_ROOT _DEVENV_HOOK_DIR _DEVENV_IN_SHELL"
         };
         let script = format!(
             "{clear_markers}\n{stale_shell}\n{src}\ncd {project:?}\n{path_override}\n_devenv_hook\n",
@@ -482,6 +576,64 @@ esac
             fs::read_to_string(&calls).unwrap_or_default().trim(),
             shell,
             "[{shell}] hook did not pass the invoking shell as its hint"
+        );
+    }
+}
+
+#[test]
+fn bash_hook_registration_prefers_blesh_over_prompt_command() {
+    // ble.sh replaces bash's line editor and prompt machinery. Entries left in
+    // PROMPT_COMMAND still run, but `blehook PRECMD` is the supported hook and
+    // the only one that runs at a real prompt: `ble-attach` renders its first
+    // prompt synchronously, so a PROMPT_COMMAND entry registered beforehand
+    // fires while the rc file is still being sourced.
+    if !have("bash") {
+        return;
+    }
+    // (case, ble.sh detection vars, expected `blehook` argv, expected PROMPT_COMMAND)
+    let cases = [
+        (
+            "ble.sh >= 0.4",
+            "BLE_VERSION=0.4.0\n_ble_version=400\n",
+            "PRECMD!=_devenv_hook",
+            "echo USER_PROMPT_COMMAND",
+        ),
+        (
+            "ble.sh 0.3 (no _ble_version)",
+            "BLE_VERSION=0.3.2\n",
+            "",
+            "_devenv_hook;echo USER_PROMPT_COMMAND",
+        ),
+        ("no ble.sh", "", "", "_devenv_hook;echo USER_PROMPT_COMMAND"),
+    ];
+    for (case, detection, expected_blehook, expected_prompt_command) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let calls = dir.path().join("blehook-calls");
+        let script = format!(
+            "unset DEVENV_ROOT _DEVENV_HOOK_DIR _DEVENV_IN_SHELL BLE_VERSION _ble_version\n\
+             {detection}\
+             PROMPT_COMMAND='echo USER_PROMPT_COMMAND'\n\
+             blehook() {{ printf '%s' \"$*\" > {calls:?}; }}\n\
+             eval \"$({bin} hook bash)\"\n\
+             printf 'PROMPT_COMMAND=%s' \"$PROMPT_COMMAND\"\n",
+            bin = devenv_bin(),
+        );
+        let out = run("bash", &script);
+        assert!(
+            out.status.success(),
+            "[{case}] hook registration failed.\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        assert_eq!(
+            fs::read_to_string(&calls).unwrap_or_default(),
+            expected_blehook,
+            "[{case}] wrong ble.sh registration"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            format!("PROMPT_COMMAND={expected_prompt_command}"),
+            "[{case}] wrong PROMPT_COMMAND"
         );
     }
 }
@@ -515,7 +667,7 @@ esac
 
     let bin = devenv_bin();
     let script = format!(
-        "set -e DEVENV_ROOT; set -e _DEVENV_HOOK_DIR\n\
+        "set -e DEVENV_ROOT; set -e _DEVENV_HOOK_DIR; set -e _DEVENV_IN_SHELL\n\
          {bin} hook fish | source\n\
          {po}\n\
          set -gx DEVENV_ROOT {root:?}\n\
@@ -591,7 +743,7 @@ fn fish_hook_bypasses_user_functions_shadowing_external_tools() {
 
     let bin = devenv_bin();
     let script = format!(
-        "set -e DEVENV_ROOT; set -e _DEVENV_HOOK_DIR\n\
+        "set -e DEVENV_ROOT; set -e _DEVENV_HOOK_DIR; set -e _DEVENV_IN_SHELL\n\
          for tool in env cat rm devenv\n\
              function $tool --inherit-variable tool\n\
                  echo INTERCEPTED_$tool\n\
@@ -678,7 +830,7 @@ fn activates_again_after_returning_to_the_same_project() {
         fs::create_dir_all(project.join(".devenv")).unwrap();
         let (_bin_dir, calls) = cd_out_shim(&project, parent.path());
         let script = format!(
-            "unset DEVENV_ROOT _DEVENV_HOOK_DIR\n\
+            "unset DEVENV_ROOT _DEVENV_HOOK_DIR _DEVENV_IN_SHELL\n\
              {src}\n\
              {po}\n\
              cd {project:?}\n\
@@ -719,7 +871,7 @@ fn nu_activates_again_after_returning_to_the_same_project() {
     fs::write(&hook_path, &hook_gen.stdout).unwrap();
 
     let script = format!(
-        "hide-env -i DEVENV_ROOT\nhide-env -i _DEVENV_HOOK_DIR\n\
+        "hide-env -i DEVENV_ROOT\nhide-env -i _DEVENV_HOOK_DIR\nhide-env -i _DEVENV_IN_SHELL\n\
          source {hook:?}\n\
          $env.PATH = ($env.PATH | prepend {bin_dir:?})\n\
          cd {project:?}\n_devenv_hook\n\
@@ -748,7 +900,7 @@ fn posix_activates_sibling_after_cd_out() {
         fs::create_dir_all(project_b.join(".devenv")).unwrap();
         let (_bin_dir, calls) = sibling_activation_shim(&project_a, &project_b);
         let script = format!(
-            "unset DEVENV_ROOT _DEVENV_HOOK_DIR\n\
+            "unset DEVENV_ROOT _DEVENV_HOOK_DIR _DEVENV_IN_SHELL\n\
              {src}\n\
              {po}\n\
              cd {project_a:?}\n\
@@ -799,7 +951,7 @@ fn activates_sibling_without_waiting_for_the_next_prompt() {
         let (shim_dir, calls) = sibling_activation_shim(&project_a, &project_b);
         let script = match shell {
             "fish" => format!(
-                "set -e DEVENV_ROOT; set -e _DEVENV_HOOK_DIR\n\
+                "set -e DEVENV_ROOT; set -e _DEVENV_HOOK_DIR; set -e _DEVENV_IN_SHELL\n\
                  source {hook:?}\n\
                  {path}\n\
                  cd {project_a:?}\n\
@@ -808,7 +960,7 @@ fn activates_sibling_without_waiting_for_the_next_prompt() {
                 path = fish_path_override(shim_dir.path()),
             ),
             "nu" => format!(
-                "hide-env -i DEVENV_ROOT\nhide-env -i _DEVENV_HOOK_DIR\n\
+                "hide-env -i DEVENV_ROOT\nhide-env -i _DEVENV_HOOK_DIR\nhide-env -i _DEVENV_IN_SHELL\n\
                  source {hook:?}\n\
                  $env.PATH = ($env.PATH | prepend {shim:?})\n\
                  cd {project_a:?}\n\
@@ -817,7 +969,7 @@ fn activates_sibling_without_waiting_for_the_next_prompt() {
                 shim = shim_dir.path(),
             ),
             _ => format!(
-                "unset DEVENV_ROOT _DEVENV_HOOK_DIR\n\
+                "unset DEVENV_ROOT _DEVENV_HOOK_DIR _DEVENV_IN_SHELL\n\
                  source {hook:?}\n\
                  {path}\n\
                  cd {project_a:?}\n\

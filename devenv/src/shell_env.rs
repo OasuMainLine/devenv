@@ -72,6 +72,8 @@ pub(crate) fn apply_shell_env(
     cmd.set_env("SHELL", shell_path);
     let cmdline = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
     cmd.set_env("DEVENV_CMDLINE", &cmdline);
+    // Persisting flag for guarding against shell looping
+    cmd.set_env("_DEVENV_IN_SHELL", "1");
     match shell_cwd {
         Some(dir) => cmd.set_env(SHELL_CWD_VAR, &dir.to_string_lossy()),
         None => cmd.remove_env(SHELL_CWD_VAR),
@@ -81,7 +83,54 @@ pub(crate) fn apply_shell_env(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::process::Command;
+
+    #[derive(Default)]
+    struct RecordingEnv(BTreeMap<String, String>);
+
+    impl CommandEnv for RecordingEnv {
+        fn clear_env(&mut self) {
+            self.0.clear();
+        }
+        fn set_env(&mut self, key: &str, value: &str) {
+            self.0.insert(key.to_string(), value.to_string());
+        }
+        fn remove_env(&mut self, key: &str) {
+            self.0.remove(key);
+        }
+    }
+
+    #[test]
+    fn marks_the_shell_so_the_hook_cannot_recurse_during_rc_sourcing() {
+        // The shell hook treats `_DEVENV_IN_SHELL` as "a devenv shell is
+        // already active". Unlike `DEVENV_ROOT`, which the env script exports
+        // only after the user's rc file has been sourced, this one is set on
+        // the child process, so it is live for the whole of that rc file.
+        // Without it, anything that renders a prompt mid-rc (ble.sh) makes the
+        // hook spawn another devenv shell, and so on without end.
+        for clean in [
+            Clean {
+                enabled: false,
+                keep: Vec::new(),
+            },
+            // `clear_env()` runs first on this path, so the marker has to be
+            // re-set afterwards rather than inherited.
+            Clean {
+                enabled: true,
+                keep: Vec::new(),
+            },
+        ] {
+            let mut env = RecordingEnv::default();
+            apply_shell_env(&mut env, "/bin/bash", &clean, None);
+            assert_eq!(
+                env.0.get("_DEVENV_IN_SHELL").map(String::as_str),
+                Some("1"),
+                "the hook's recursion guard must be set (clean={})",
+                clean.enabled,
+            );
+        }
+    }
 
     fn run_cd_into_shell_cwd(shell_cwd: Option<&Path>, oldpwd: Option<&str>) -> String {
         let mut cmd = Command::new("bash");

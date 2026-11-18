@@ -652,6 +652,54 @@ export DEVENV_RELOAD_TEST_VAR=reload_works
     }
 
     #[test]
+    fn bash_rcfile_clears_the_in_shell_marker() {
+        // `_DEVENV_IN_SHELL` tells the shell hook that a devenv shell is
+        // already active. It is exported onto this process, so it would
+        // otherwise be inherited by anything started later from this shell (a
+        // new tmux pane, a nested shell), leaving those unable to activate any
+        // project. The hook scrubs it too, but only when the user's rc file
+        // sources the hook at all — the rcfile has to stand on its own.
+        let tmp = unique_tmp_dir("bash-in-shell-marker");
+        let empty_home = tmp.join("home");
+        std::fs::create_dir_all(&empty_home).unwrap();
+        let env_script = tmp.join("env.sh");
+        std::fs::write(&env_script, "").unwrap();
+
+        let shell_keybindings = ShellKeybindings::default();
+        let ctx = RcfileContext {
+            env_script_path: &env_script,
+            env_diff_helpers: BashDialect.env_diff_helpers(),
+            reload_hook: "",
+            target_shell_path: None,
+            init_dir: &tmp,
+            shell_keybindings: &shell_keybindings,
+            prompt_prefix: false,
+        };
+        let rcfile_path = tmp.join("rcfile.sh");
+        std::fs::write(&rcfile_path, BashDialect.rcfile_content(&ctx)).unwrap();
+
+        let script = format!(
+            "source {rcfile_path:?}\nprintf 'MARKER=%s' \"${{_DEVENV_IN_SHELL:-unset}}\"\n"
+        );
+        let output = Command::new("bash")
+            .env("HOME", &empty_home)
+            .env("_DEVENV_IN_SHELL", "1")
+            .env_remove("_DEVENV_HOOK_DIR")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .expect("failed to run bash rcfile");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "MARKER=unset",
+            "[bash] rcfile left _DEVENV_IN_SHELL in the environment.\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn bash_rcfile_exits_on_cd_out_when_hook_spawned() {
         let tmp = unique_tmp_dir("bash-cdout");
         let root = tmp.join("project");

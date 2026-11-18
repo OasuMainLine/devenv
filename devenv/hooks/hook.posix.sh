@@ -21,13 +21,19 @@ if [[ -n "${_DEVENV_HOOK_DIR:-}" ]]; then
     unset _DEVENV_HOOK_DIR
 fi
 
+if [[ -n "${_DEVENV_IN_SHELL:-}" ]]; then
+    _devenv_in_shell="$_DEVENV_IN_SHELL"
+    unset _DEVENV_IN_SHELL
+fi
+
 _devenv_hook() {
     local previous_exit_status=$?
 
     # `DEVENV_ROOT` set means a devenv shell is already active — hook does
     # nothing. Hook-spawned shells (marked by `_devenv_hook_dir`) additionally
     # `exit` when cd-ing outside the project so the parent shell can follow.
-    if [[ -n "${DEVENV_ROOT:-}" ]]; then
+    # _DEVENV_IN_SHELL is a final stopping gate to prevent looping, in case a script (e.g `.bashrc`) re-runs devenv.
+    if [[ -n "${DEVENV_ROOT:-}${_devenv_in_shell:-}" ]]; then
         if [[ -n "${_devenv_hook_dir:-}" ]]; then
             case "$PWD" in
                 "${DEVENV_ROOT}"|"${DEVENV_ROOT}"/*) ;;
